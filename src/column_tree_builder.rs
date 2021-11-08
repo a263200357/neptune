@@ -1,11 +1,13 @@
-use crate::batch_hasher::Batcher;
+use crate::batch_hasher::{Batcher, BatcherType};
 use crate::error::Error;
 use crate::poseidon::{Poseidon, PoseidonConstants};
 use crate::tree_builder::{TreeBuilder, TreeBuilderTrait};
 use crate::{Arity, BatchHasher};
-use blstrs::Scalar as Fr;
+use bellperson::bls::{Bls12, Fr};
 use ff::Field;
 use generic_array::GenericArray;
+#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+use rust_gpu_tools::opencl::GPUSelector;
 
 pub trait ColumnTreeBuilderTrait<ColumnArity, TreeArity>
 where
@@ -30,7 +32,7 @@ where
     data: Vec<Fr>,
     /// Index of the first unfilled datum.
     fill_index: usize,
-    column_constants: PoseidonConstants<Fr, ColumnArity>,
+    column_constants: PoseidonConstants<Bls12, ColumnArity>,
     pub column_batcher: Option<Batcher<ColumnArity>>,
     tree_builder: TreeBuilder<TreeArity>,
 }
@@ -82,7 +84,7 @@ where
         self.data.iter_mut().for_each(|place| *place = Fr::zero());
     }
 }
-fn as_generic_arrays<A: Arity<Fr>>(vec: &[Fr]) -> &[GenericArray<Fr, A>] {
+fn as_generic_arrays<'a, A: Arity<Fr>>(vec: &'a [Fr]) -> &'a [GenericArray<Fr, A>] {
     // It is a programmer error to call `as_generic_arrays` on a vector whose underlying data cannot be divided
     // into an even number of `GenericArray<Fr, Arity>`.
     assert_eq!(
@@ -106,17 +108,47 @@ where
     TreeArity: Arity<Fr>,
 {
     pub fn new(
-        column_batcher: Option<Batcher<ColumnArity>>,
-        tree_batcher: Option<Batcher<TreeArity>>,
+        t: Option<BatcherType>,
         leaf_count: usize,
+        max_column_batch_size: usize,
+        max_tree_batch_size: usize,
     ) -> Result<Self, Error> {
-        let tree_builder = TreeBuilder::<TreeArity>::new(tree_batcher, leaf_count, 0)?;
+        let column_batcher = match &t {
+            Some(t) => Some(Batcher::<ColumnArity>::new(t, max_column_batch_size)?),
+            None => None,
+        };
+
+        let tree_builder = match {
+            match &column_batcher {
+                #[cfg(feature = "gpu")]
+                Some(b) => b.futhark_context(),
+                #[cfg(feature = "opencl")]
+                Some(b) => b.device(),
+                None => None,
+            }
+        } {
+            #[cfg(feature = "gpu")]
+            Some(ctx) => TreeBuilder::<TreeArity>::new(
+                Some(BatcherType::FromFutharkContext(ctx)),
+                leaf_count,
+                max_tree_batch_size,
+                0,
+            )?,
+            #[cfg(feature = "opencl")]
+            Some(device) => TreeBuilder::<TreeArity>::new(
+                Some(BatcherType::FromDevice(device)),
+                leaf_count,
+                max_tree_batch_size,
+                0,
+            )?,
+            None => TreeBuilder::<TreeArity>::new(t, leaf_count, max_tree_batch_size, 0)?,
+        };
 
         let builder = Self {
             leaf_count,
             data: vec![Fr::zero(); leaf_count],
             fill_index: 0,
-            column_constants: PoseidonConstants::<Fr, ColumnArity>::new(),
+            column_constants: PoseidonConstants::<Bls12, ColumnArity>::new(),
             column_batcher,
             tree_builder,
         };
@@ -141,16 +173,13 @@ where
     }
 }
 
-#[cfg(all(
-    any(feature = "futhark", feature = "cuda", feature = "opencl"),
-    not(target_os = "macos")
-))]
+#[cfg(all(any(feature = "gpu", feature = "opencl"), not(target_os = "macos")))]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poseidon::{Arity, Poseidon};
+    use crate::poseidon::Poseidon;
     use crate::BatchHasher;
-    use blstrs::Scalar as Fr;
+    use bellperson::bls::Fr;
     use ff::Field;
     use generic_array::sequence::GenericSequence;
     use generic_array::typenum::{U11, U8};
@@ -158,32 +187,32 @@ mod tests {
     #[test]
     fn test_column_tree_builder() {
         // 16KiB tree has 512 leaves.
-        test_column_tree_builder_aux(None, None, 512, 32);
-        test_column_tree_builder_aux(
-            Some(Batcher::new_cpu(512)),
-            Some(Batcher::new_cpu(512)),
-            512,
-            32,
-        );
+        test_column_tree_builder_aux(None, 512, 32, 512, 512);
+        test_column_tree_builder_aux(Some(BatcherType::CPU), 512, 32, 512, 512);
 
-        test_column_tree_builder_aux(
-            Some(Batcher::pick_gpu(512).unwrap()),
-            Some(Batcher::pick_gpu(512).unwrap()),
-            512,
-            32,
-        );
+        #[cfg(feature = "gpu")]
+        test_column_tree_builder_aux(Some(BatcherType::GPU), 512, 32, 512, 512);
+
+        #[cfg(feature = "opencl")]
+        test_column_tree_builder_aux(Some(BatcherType::OpenCL), 512, 32, 512, 512);
     }
 
     fn test_column_tree_builder_aux(
-        column_batcher: Option<Batcher<U11>>,
-        tree_batcher: Option<Batcher<U8>>,
+        batcher_type: Option<BatcherType>,
         leaves: usize,
         num_batches: usize,
+        max_column_batch_size: usize,
+        max_tree_batch_size: usize,
     ) {
         let batch_size = leaves / num_batches;
 
-        let mut builder =
-            ColumnTreeBuilder::<U11, U8>::new(column_batcher, tree_batcher, leaves).unwrap();
+        let mut builder = ColumnTreeBuilder::<U11, U8>::new(
+            batcher_type,
+            leaves,
+            max_column_batch_size,
+            max_tree_batch_size,
+        )
+        .unwrap();
 
         // Simplify computing the expected root.
         let constant_element = Fr::zero();
